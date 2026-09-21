@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getOpenPullRequests, normalizeGitHubError } from '@/lib/github';
+import { getGitHubAccessTokenFromSession, getOpenPullRequests, normalizeGitHubError } from '@/lib/github';
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -16,7 +16,8 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const pullRequests = await getOpenPullRequests(repository.trim());
+    const token = await getGitHubAccessTokenFromSession();
+    const pullRequests = await getOpenPullRequests(repository.trim(), token);
 
     return NextResponse.json({
       success: true,

@@ -4,6 +4,7 @@ import {
   getRepository,
   branchExists,
   findOpenPullRequest,
+  getGitHubAccessTokenFromSession,
   normalizeGitHubError,
 } from '@/lib/github';
 import type { CreateReviewRequest } from '@/types';
@@ -25,6 +26,7 @@ import type { CreateReviewRequest } from '@/types';
  */
 export async function POST(req: NextRequest) {
   let body: unknown;
+  const authToken = await getGitHubAccessTokenFromSession();
 
   try {
     body = await req.json();
@@ -76,7 +78,7 @@ export async function POST(req: NextRequest) {
 
   // ── Repository existence check (uses mock/service layer) ───────────────────
   try {
-    const repo = await getRepository(repository);
+    const repo = await getRepository(repository, authToken);
     if (!repo) {
       return NextResponse.json(
         {
@@ -100,8 +102,8 @@ export async function POST(req: NextRequest) {
   // ── Branch existence checks ─────────────────────────────────────────────────
   try {
     const [sourceExists, targetExists] = await Promise.all([
-      branchExists(repository, source_branch),
-      branchExists(repository, target_branch),
+      branchExists(repository, source_branch, authToken),
+      branchExists(repository, target_branch, authToken),
     ]);
 
     if (!sourceExists) {
@@ -135,7 +137,7 @@ export async function POST(req: NextRequest) {
 
   // ── Reuse an existing open PR when the same branch pairing already exists ──
   try {
-    const existingOpenPR = await findOpenPullRequest(repository, source_branch, target_branch);
+    const existingOpenPR = await findOpenPullRequest(repository, source_branch, target_branch, authToken);
 
     if (existingOpenPR) {
       return NextResponse.json(

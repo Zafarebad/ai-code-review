@@ -2,13 +2,24 @@
  * GitHub Service — server-side only
  *
  * Uses the GitHub REST API to fetch repositories and branches for the authenticated
- * user. The token is read from process.env.GITHUB_TOKEN and never exposed to the
- * browser or client-side code.
+ * user. Access tokens are read from the logged-in session cookie when available,
+ * otherwise the existing server-side GITHUB_TOKEN fallback is used. Tokens are never
+ * exposed to browser or client-side code.
  */
 
+import { cookies } from 'next/headers';
 import type { Repository, Branch, PullRequestSummary } from '@/types';
 
 const GITHUB_API_BASE = 'https://api.github.com';
+
+export interface GitHubUserSession {
+  token: string;
+  login: string;
+  avatarUrl?: string | null;
+  installationId?: string | null;
+  setupAction?: string | null;
+  expiresAt: number;
+}
 
 export class GitHubApiError extends Error {
   status: number;
@@ -22,19 +33,86 @@ export class GitHubApiError extends Error {
   }
 }
 
-function getGitHubToken(): string {
-  const token = process.env.GITHUB_TOKEN;
+export async function getGitHubSession(): Promise<GitHubUserSession | null> {
+  const cookieStore = await cookies();
+  const sessionCookie = cookieStore.get('github_user_session');
 
-  if (!token || !token.trim()) {
-    throw new Error('GITHUB_TOKEN is not configured on the server.');
+  if (!sessionCookie?.value) {
+    return null;
   }
 
-  return token.trim();
+  try {
+    const session = JSON.parse(sessionCookie.value) as Partial<GitHubUserSession>;
+
+    if (
+      typeof session.token === 'string' &&
+      session.token.trim() &&
+      typeof session.login === 'string' &&
+      session.login.trim() &&
+      typeof session.expiresAt === 'number'
+    ) {
+      return {
+        token: session.token.trim(),
+        login: session.login.trim(),
+        avatarUrl: typeof session.avatarUrl === 'string' ? session.avatarUrl : null,
+        installationId: typeof session.installationId === 'string' ? session.installationId : null,
+        setupAction: typeof session.setupAction === 'string' ? session.setupAction : null,
+        expiresAt: session.expiresAt,
+      };
+    }
+  } catch {
+    // Ignore malformed cookie values and fall back to any configured server token.
+  }
+
+  return null;
 }
 
-function getGitHubHeaders(): HeadersInit {
+export async function getGitHubAccessTokenFromSession({ allowFallback = false }: { allowFallback?: boolean } = {}): Promise<string> {
+  const session = await getGitHubSession();
+
+  if (session?.token) {
+    return session.token;
+  }
+
+  if (allowFallback) {
+    const fallbackToken = process.env.GITHUB_TOKEN?.trim();
+
+    if (fallbackToken) {
+      return fallbackToken;
+    }
+  }
+
+  throw new Error('No authenticated GitHub user session is available for this request.');
+}
+
+async function resolveGitHubAccessToken(tokenOverride?: string): Promise<{ token: string; source: 'override' | 'session' | 'fallback' }> {
+  const explicitToken = tokenOverride?.trim();
+
+  if (explicitToken) {
+    return { token: explicitToken, source: 'override' };
+  }
+
+  const session = await getGitHubSession();
+
+  if (session?.token) {
+    return { token: session.token, source: 'session' };
+  }
+
+  const fallbackToken = process.env.GITHUB_TOKEN?.trim();
+
+  if (fallbackToken) {
+    console.warn('[github-auth] Using development GITHUB_TOKEN fallback because no authenticated session was found.');
+    return { token: fallbackToken, source: 'fallback' };
+  }
+
+  throw new Error('GitHub access token is not configured on the server.');
+}
+
+async function getGitHubHeaders(tokenOverride?: string): Promise<HeadersInit> {
+  const { token } = await resolveGitHubAccessToken(tokenOverride);
+
   return {
-    Authorization: `Bearer ${getGitHubToken()}`,
+    Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
     'User-Agent': 'ai-code-review-app',
@@ -150,10 +228,10 @@ function parseGitHubErrorBody(raw: string): string {
   return raw.trim();
 }
 
-async function githubFetch<T>(url: string): Promise<T> {
+async function githubFetch<T>(url: string, tokenOverride?: string): Promise<T> {
   try {
     const response = await fetch(url, {
-      headers: getGitHubHeaders(),
+      headers: await getGitHubHeaders(tokenOverride),
       cache: 'no-store',
     });
 
@@ -178,28 +256,164 @@ async function githubFetch<T>(url: string): Promise<T> {
   }
 }
 
+async function githubFetchWithHeaders<T>(url: string, tokenOverride?: string): Promise<{ data: T; headers: Headers }> {
+  try {
+    const response = await fetch(url, {
+      headers: await getGitHubHeaders(tokenOverride),
+      cache: 'no-store',
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const detail = parseGitHubErrorBody(errorText);
+      throw normalizeGitHubStatusError(response.status, detail);
+    }
+
+    return {
+      data: (await response.json()) as T,
+      headers: response.headers,
+    };
+  } catch (error: unknown) {
+    if (error instanceof GitHubApiError) {
+      throw error;
+    }
+
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new GitHubApiError(504, 'TIMEOUT', 'GitHub request timed out. Please try again later.');
+    }
+
+    const message = error instanceof Error ? error.message : 'GitHub request failed.';
+    throw new GitHubApiError(503, 'NETWORK_ERROR', message || 'GitHub request failed. Please try again later.');
+  }
+}
+
+function getNextPageUrl(linkHeader: string | null): string | null {
+  if (!linkHeader) {
+    return null;
+  }
+
+  const matches = linkHeader.split(',');
+
+  for (const match of matches) {
+    const linkMatch = match.match(/<([^>]+)>;\s*rel="next"/i);
+    if (linkMatch?.[1]) {
+      return linkMatch[1];
+    }
+  }
+
+  return null;
+}
+
+function isTargetGitHubAppInstallation(installation: Record<string, unknown>): boolean {
+  const appSlug = typeof installation.app_slug === 'string'
+    ? installation.app_slug.trim().toLowerCase()
+    : '';
+
+  const appIdValue = installation.app_id;
+  const appId = typeof appIdValue === 'number'
+    ? appIdValue
+    : typeof appIdValue === 'string' && appIdValue.trim() !== ''
+      ? Number(appIdValue)
+      : Number.NaN;
+
+  return appSlug === 'ai-code-automation' || (!Number.isNaN(appId) && appId === 5021652);
+}
+
+async function getGitHubAppInstallations(tokenOverride?: string): Promise<Array<Record<string, unknown>>> {
+  const installations: Array<Record<string, unknown>> = [];
+  let nextUrl: string | null = `${GITHUB_API_BASE}/user/installations?per_page=100`;
+
+  while (nextUrl) {
+    const installationPage: {
+      data: { installations?: Array<Record<string, unknown>> };
+      headers: Headers;
+    } = await githubFetchWithHeaders<{ installations?: Array<Record<string, unknown>> }>(nextUrl, tokenOverride);
+    const pageInstallations: Array<Record<string, unknown>> = Array.isArray(installationPage.data.installations)
+      ? installationPage.data.installations
+      : [];
+
+    installations.push(...pageInstallations.filter((installation): installation is Record<string, unknown> => Boolean(installation && typeof installation === 'object')));
+
+    nextUrl = getNextPageUrl(installationPage.headers.get('link')) ?? null;
+  }
+
+  return installations;
+}
+
+async function getRepositoriesForInstallation(installationId: string | number, tokenOverride?: string): Promise<Repository[]> {
+  const repositories: Repository[] = [];
+  const uniqueRepositories = new Map<string, Repository>();
+  let nextUrl: string | null = `${GITHUB_API_BASE}/user/installations/${installationId}/repositories?per_page=100`;
+
+  while (nextUrl) {
+    const repositoryPage: {
+      data: { repositories?: Array<Record<string, unknown>> };
+      headers: Headers;
+    } = await githubFetchWithHeaders<{ repositories?: Array<Record<string, unknown>> }>(nextUrl, tokenOverride);
+    const pageRepositories: Array<Record<string, unknown>> = Array.isArray(repositoryPage.data.repositories)
+      ? repositoryPage.data.repositories
+      : [];
+
+    pageRepositories
+      .filter((repo): repo is Record<string, unknown> => Boolean(repo && typeof repo === 'object'))
+      .map((repo) => normalizeRepository(repo))
+      .forEach((repo) => {
+        const key = `${repo.owner}/${repo.name}`.toLowerCase();
+        if (!uniqueRepositories.has(key)) {
+          uniqueRepositories.set(key, repo);
+        }
+      });
+
+    nextUrl = getNextPageUrl(repositoryPage.headers.get('link')) ?? null;
+  }
+
+  uniqueRepositories.forEach((repo) => repositories.push(repo));
+  return repositories;
+}
+
 // ──────────────────────────────────────────────
 // Public API
 // ──────────────────────────────────────────────
 
 /**
- * Return all repositories available to the authenticated user.
+ * Return all repositories accessible to the authenticated GitHub App installation.
  */
-export async function getRepositories(): Promise<Repository[]> {
-  const repos = await githubFetch<Array<Record<string, unknown>>>(
-    `${GITHUB_API_BASE}/user/repos?per_page=100&sort=updated`
-  );
+export async function getRepositories(tokenOverride?: string): Promise<Repository[]> {
+  const installations = await getGitHubAppInstallations(tokenOverride);
+  const appInstallations = installations.filter(isTargetGitHubAppInstallation);
 
-  return repos
-    .filter((repo) => repo && typeof repo === 'object')
-    .map((repo) => normalizeRepository(repo));
+  if (!appInstallations.length) {
+    return [];
+  }
+
+  const uniqueRepositories = new Map<string, Repository>();
+
+  for (const installation of appInstallations) {
+    const installationId = installation.id;
+
+    if (typeof installationId !== 'number' && typeof installationId !== 'string') {
+      continue;
+    }
+
+    const repos = await getRepositoriesForInstallation(installationId, tokenOverride);
+
+    repos.forEach((repo) => {
+      const key = `${repo.owner}/${repo.name}`.toLowerCase();
+      if (!uniqueRepositories.has(key)) {
+        uniqueRepositories.set(key, repo);
+      }
+    });
+  }
+
+  return [...uniqueRepositories.values()];
 }
 
 /**
  * Return a single repository by full name.
  */
 export async function getRepository(
-  fullName: string
+  fullName: string,
+  tokenOverride?: string
 ): Promise<Repository | null> {
   const [owner, repoName] = fullName.split('/');
 
@@ -209,7 +423,8 @@ export async function getRepository(
 
   try {
     const repo = await githubFetch<Record<string, unknown>>(
-      `${GITHUB_API_BASE}/repos/${owner}/${repoName}`
+      `${GITHUB_API_BASE}/repos/${owner}/${repoName}`,
+      tokenOverride
     );
 
     return normalizeRepository(repo);
@@ -227,7 +442,7 @@ export async function getRepository(
 /**
  * Return all branches for a repository.
  */
-export async function getBranches(repoFullName: string): Promise<Branch[]> {
+export async function getBranches(repoFullName: string, tokenOverride?: string): Promise<Branch[]> {
   const [owner, repoName] = repoFullName.split('/');
 
   if (!owner || !repoName) {
@@ -235,7 +450,8 @@ export async function getBranches(repoFullName: string): Promise<Branch[]> {
   }
 
   const branches = await githubFetch<Array<Record<string, unknown>>>(
-    `${GITHUB_API_BASE}/repos/${owner}/${repoName}/branches`
+    `${GITHUB_API_BASE}/repos/${owner}/${repoName}/branches`,
+    tokenOverride
   );
 
   return branches
@@ -244,7 +460,8 @@ export async function getBranches(repoFullName: string): Promise<Branch[]> {
 }
 
 export async function getOpenPullRequests(
-  repoFullName: string
+  repoFullName: string,
+  tokenOverride?: string
 ): Promise<PullRequestSummary[]> {
   const [owner, repoName] = repoFullName.split('/');
 
@@ -253,7 +470,8 @@ export async function getOpenPullRequests(
   }
 
   const pulls = await githubFetch<Array<Record<string, unknown>>>(
-    `${GITHUB_API_BASE}/repos/${owner}/${repoName}/pulls?state=open&per_page=100`
+    `${GITHUB_API_BASE}/repos/${owner}/${repoName}/pulls?state=open&per_page=100`,
+    tokenOverride
   );
 
   return pulls
@@ -301,9 +519,10 @@ export async function getOpenPullRequests(
  */
 export async function branchExists(
   repoFullName: string,
-  branchName: string
+  branchName: string,
+  tokenOverride?: string
 ): Promise<boolean> {
-  const branches = await getBranches(repoFullName);
+  const branches = await getBranches(repoFullName, tokenOverride);
   return branches.some((b) => b.name === branchName);
 }
 
@@ -314,7 +533,8 @@ export async function branchExists(
 export async function findOpenPullRequest(
   repoFullName: string,
   sourceBranch: string,
-  targetBranch: string
+  targetBranch: string,
+  tokenOverride?: string
 ): Promise<{
   number: number;
   url: string;
@@ -330,7 +550,8 @@ export async function findOpenPullRequest(
 
   try {
     const pulls = await githubFetch<Array<Record<string, unknown>>>(
-      `${GITHUB_API_BASE}/repos/${owner}/${repoName}/pulls?state=open&head=${owner}:${sourceBranch}&base=${targetBranch}`
+      `${GITHUB_API_BASE}/repos/${owner}/${repoName}/pulls?state=open&head=${owner}:${sourceBranch}&base=${targetBranch}`,
+      tokenOverride
     );
 
     const pr = pulls.find((item) => {
