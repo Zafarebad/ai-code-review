@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getBranches } from '@/lib/github';
+import { getBranches, getGitHubAccessTokenFromSession } from '@/lib/github';
 
 interface RouteParams {
   params: Promise<{ repo: string }>;
@@ -26,7 +26,8 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
   }
 
   try {
-    const branches = await getBranches(repoFullName);
+    const token = await getGitHubAccessTokenFromSession();
+    const branches = await getBranches(repoFullName, token);
     return NextResponse.json({ branches });
   } catch (err: unknown) {
     console.error('[/api/branches]', err);
