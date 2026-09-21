@@ -13,20 +13,7 @@ function getClientId(): string {
 }
 
 function getRedirectUri(request: NextRequest): string {
-  const host = request.headers.get('x-forwarded-host') || request.headers.get('host');
-
-  if (host) {
-    const protocol = request.headers.get('x-forwarded-proto') || 'https';
-    return `${protocol}://${host}/api/auth/github/callback`;
-  }
-
-  const isLocalHost = process.env.NODE_ENV !== 'production';
-
-  if (isLocalHost) {
-    return 'http://localhost:3000/api/auth/github/callback';
-  }
-
-  return 'https://ai-code-review.ebad-zafar00.workers.dev/api/auth/github/callback';
+  return new URL('/api/auth/github/callback', request.url).toString();
 }
 
 export async function GET(request: NextRequest) {
