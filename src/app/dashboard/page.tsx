@@ -4,13 +4,17 @@ import { DashboardHeader } from '@/components/dashboard/DashboardHeader';
 import { ReviewForm } from '@/components/dashboard/ReviewForm';
 import { Badge } from '@/components/ui/Badge';
 import { BackgroundVideo } from '@/components/ui/BackgroundVideo';
+import { getGitHubSession } from '@/lib/github';
 
 export const metadata: Metadata = {
   title: 'Dashboard',
   description: 'Create Pull Requests and run AI code reviews from the dashboard.',
 };
 
-export default function DashboardPage() {
+export default async function DashboardPage() {
+  const session = await getGitHubSession();
+  const isGitHubConnected = Boolean(session?.token);
+
   return (
     <div className="relative min-h-full flex flex-col">
       {/* Background Video */}
@@ -30,7 +34,7 @@ export default function DashboardPage() {
 
         <div className="flex-1 px-6 py-8">
           <div className="max-w-2xl mx-auto space-y-8">
-            <DashboardHeader />
+            <DashboardHeader isGitHubConnected={isGitHubConnected} />
             <ReviewForm />
 
             {/* Feature info cards with glassmorphism */}
