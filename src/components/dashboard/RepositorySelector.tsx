@@ -62,13 +62,24 @@ export function RepositorySelector({
   }
 
   if (fetchError) {
+    const isGitHubAuthError = fetchError.toLowerCase().includes('authorize github access') ||
+      fetchError.toLowerCase().includes('github authentication');
+
     return (
       <div className="flex flex-col gap-1.5">
         <label className="text-sm font-medium text-[var(--color-text-secondary)]">
           Repository
         </label>
-        <div className="h-9 px-3 flex items-center rounded-[var(--radius-md)] bg-[oklch(0.65_0.22_25/0.1)] border border-[oklch(0.65_0.22_25/0.3)]">
+        <div className="flex flex-col gap-2 rounded-[var(--radius-md)] bg-[oklch(0.65_0.22_25/0.1)] border border-[oklch(0.65_0.22_25/0.3)] p-3">
           <span className="text-xs text-[var(--color-error)]">{fetchError}</span>
+          {isGitHubAuthError && (
+            <a
+              href="/api/auth/github/login"
+              className="inline-flex items-center justify-center h-9 px-4 text-sm font-medium rounded-[var(--radius-md)] bg-[var(--color-brand-600)] text-white hover:bg-[var(--color-brand-500)] active:bg-[var(--color-brand-700)] transition-colors w-fit"
+            >
+              Connect GitHub
+            </a>
+          )}
         </div>
       </div>
     );

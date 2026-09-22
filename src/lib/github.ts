@@ -49,7 +49,8 @@ export async function getGitHubSession(): Promise<GitHubUserSession | null> {
       session.token.trim() &&
       typeof session.login === 'string' &&
       session.login.trim() &&
-      typeof session.expiresAt === 'number'
+      typeof session.expiresAt === 'number' &&
+      session.expiresAt > Date.now()
     ) {
       return {
         token: session.token.trim(),
